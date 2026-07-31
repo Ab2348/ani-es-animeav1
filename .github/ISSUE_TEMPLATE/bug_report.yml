@@ -1,0 +1,55 @@
+name: Reporte de error
+description: Informa un problema reproducible con ani-es-animeav1.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        No pegues cookies, tokens ni URLs completas con parámetros. Ejecuta primero `./tests/run-tests.sh`.
+  - type: input
+    id: version
+    attributes:
+      label: Versión
+      description: Salida de `ani-es --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Plataforma
+      options:
+        - Linux
+        - WSL
+        - macOS
+        - Otra
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Pasos para reproducirlo
+      description: Incluye el comando utilizado, ocultando datos privados.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Resultado esperado
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Resultado observado
+      description: Puedes incluir el diagnóstico, después de revisar y redactar URLs o datos privados.
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacidad
+      options:
+        - label: Revisé el reporte y eliminé cookies, tokens, rutas personales y URLs sensibles.
+          required: true

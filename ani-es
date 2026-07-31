@@ -1,0 +1,1219 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+if ((BASH_VERSINFO[0] < 4)); then
+    printf '[ani-es] Se requiere Bash 4.0 o posterior.\n' >&2
+    exit 1
+fi
+
+umask 077
+
+ANI_ES_PROJECT="ani-es-animeav1"
+VERSION="2.0.0"
+PROVIDER="${ANI_ES_PROVIDER:-animeav1}"
+# Cada invocación comienza en DUB. SUB solo se activa explícitamente con --sub.
+LANGUAGE="dub"
+PREFERRED_SERVER="${ANI_ES_SERVER:-auto}"
+USER_AGENT="${ANI_ES_USER_AGENT:-Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36}"
+DEBUG="${ANI_ES_DEBUG:-0}"
+KEEP_WORKDIR="${ANI_ES_KEEP_WORKDIR:-0}"
+HTTP_TIMEOUT="${ANI_ES_HTTP_TIMEOUT:-50}"
+
+CONTINUE=0
+QUERY=""
+WORKDIR=""
+BASE_URL=""
+ANIME_TYPE=""
+EPISODE_TOTAL=""
+LAST_POSITION="0"
+EPISODE_MAP_FILE=""
+RESOLVE_STATUS_FILE=""
+RESOLVE_FAILURES_FILE=""
+PROBE_HTTP_STATUS=""
+PROBE_CONTENT_TYPE=""
+PROBE_REASON=""
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+STATE_DIR="${ANI_ES_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ani-es}"
+HISTORY_FILE="$STATE_DIR/history.json"
+LEGACY_DIR="$HOME/ani-es"
+LEGACY_JSON="$LEGACY_DIR/history.json"
+LEGACY_DB="$LEGACY_DIR/history.db"
+
+info() { printf '%b\n' "${BLUE}[ani-es]${NC} $*" >&2; }
+warn() { printf '%b\n' "${YELLOW}[ani-es]${NC} $*" >&2; }
+die() { printf '%b\n' "${RED}[ani-es]${NC} $*" >&2; exit 1; }
+debug() {
+    [[ "$DEBUG" == "1" ]] || return 0
+    printf '%b\n' "${CYAN}[ani-es:debug]${NC} $*" >&2
+}
+
+redact_url() {
+    python3 - "$1" <<'PYREDACT'
+import sys
+from urllib.parse import urlsplit, urlunsplit
+value = sys.argv[1]
+try:
+    url = urlsplit(value)
+    query = "<redacted>" if url.query else ""
+    fragment = "<redacted>" if url.fragment else ""
+    print(urlunsplit((url.scheme, url.netloc, url.path, query, fragment)))
+except Exception:
+    print("<url inválida>")
+PYREDACT
+}
+
+redact_sensitive_text() {
+    python3 - "$1" <<'PYREDACTTEXT'
+import re, sys
+from urllib.parse import urlsplit, urlunsplit
+text = sys.argv[1]
+def clean(match):
+    raw = match.group(0)
+    try:
+        url = urlsplit(raw)
+        return urlunsplit((url.scheme, url.netloc, url.path,
+                           "<redacted>" if url.query else "",
+                           "<redacted>" if url.fragment else ""))
+    except Exception:
+        return "<url inválida>"
+print(re.sub(r'https?://[^\s<>]+', clean, text), end='')
+PYREDACTTEXT
+}
+
+cleanup() {
+    if [[ -n "${WORKDIR:-}" && -d "$WORKDIR" ]]; then
+        if [[ "$KEEP_WORKDIR" == "1" ]]; then
+            info "WORKDIR conservado en $WORKDIR"
+        else
+            rm -rf -- "$WORKDIR"
+        fi
+    fi
+}
+trap cleanup EXIT INT TERM HUP
+
+show_help() {
+    cat <<'HELP'
+Uso:
+  ani-es [opciones] [búsqueda]
+
+Opciones:
+  -c, --continue             Continuar desde el historial
+  -p, --provider PROVEEDOR   animeav1 (predeterminado) o jkanime
+      --sub                  Usar versión subtitulada
+      --dub                  Usar versión doblada (predeterminado)
+      --server SERVIDOR      auto, hls, pdrain, upnshare, mp4upload, mega...
+      --debug                Mostrar diagnóstico de resolución y reproducción
+      --keep-workdir         Conservar los artefactos temporales al salir
+  -u, --update               Actualizar desde ANI_ES_UPDATE_URL, sin sudo
+  -v, --version              Mostrar versión
+  -h, --help                 Mostrar ayuda
+
+Variables equivalentes:
+  ANI_ES_PROVIDER, ANI_ES_SERVER
+  ANI_ES_STATE_DIR, ANI_ES_PLAYER, ANI_ES_PLAYER_FLAGS
+  ANI_ES_UPDATE_URL, ANI_ES_UPDATE_SHA256
+  ANI_ES_DEBUG, ANI_ES_KEEP_WORKDIR, ANI_ES_HTTP_TIMEOUT, ANI_ES_USER_AGENT
+HELP
+}
+
+show_version() {
+    printf 'ani-es v%s — proveedor %s\n' "$VERSION" "$PROVIDER"
+}
+
+provider_init() {
+    case "${PROVIDER,,}" in
+        animeav1|av1)
+            PROVIDER="animeav1"
+            BASE_URL="https://animeav1.com"
+            ;;
+        jkanime|jk)
+            PROVIDER="jkanime"
+            BASE_URL="https://jkanime.net"
+            ;;
+        *) die "Proveedor no soportado: $PROVIDER" ;;
+    esac
+
+    case "${LANGUAGE,,}" in
+        sub|subs|subtitulado) LANGUAGE="sub" ;;
+        dub|doblado) LANGUAGE="dub" ;;
+        *) die "Idioma no soportado: $LANGUAGE. Usa sub o dub." ;;
+    esac
+
+    [[ "$HTTP_TIMEOUT" =~ ^[0-9]+$ && "$HTTP_TIMEOUT" -gt 0 ]] || die "ANI_ES_HTTP_TIMEOUT debe ser un entero positivo."
+}
+
+check_dependencies() {
+    local missing=() command_name
+    for command_name in curl fzf grep sed jq python3; do
+        command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+    done
+
+    local player="${ANI_ES_PLAYER:-mpv}"
+    command -v "$player" >/dev/null 2>&1 || missing+=("$player")
+
+    if ((${#missing[@]})); then
+        die "Faltan dependencias: ${missing[*]}"
+    fi
+}
+
+init_state() {
+    mkdir -p -- "$STATE_DIR"
+    [[ -f "$HISTORY_FILE" ]] || printf '{}\n' > "$HISTORY_FILE"
+
+    if ! jq empty "$HISTORY_FILE" >/dev/null 2>&1; then
+        local backup="$HISTORY_FILE.corrupt.$(date +%s)"
+        mv -- "$HISTORY_FILE" "$backup"
+        printf '{}\n' > "$HISTORY_FILE"
+        warn "El historial estaba dañado. Se guardó en $backup"
+    fi
+
+    if [[ "$HISTORY_FILE" != "$LEGACY_JSON" && -f "$LEGACY_JSON" ]]; then
+        local tmp
+        tmp=$(mktemp "$STATE_DIR/history.XXXXXX") || die "No se pudo crear un temporal"
+        if jq -s '.[0] * .[1]' "$HISTORY_FILE" "$LEGACY_JSON" > "$tmp"; then
+            mv -- "$tmp" "$HISTORY_FILE"
+            mv -- "$LEGACY_JSON" "$LEGACY_JSON.migrated"
+            info "Historial JSON anterior importado."
+        else
+            rm -f -- "$tmp"
+        fi
+    fi
+
+    [[ -f "$LEGACY_DB" ]] && migrate_legacy_db || true
+}
+
+migrate_legacy_db() {
+    python3 - "$LEGACY_DB" "$HISTORY_FILE" <<'PY'
+import json, sqlite3, sys
+from pathlib import Path
+legacy, target = map(Path, sys.argv[1:3])
+try:
+    data = json.loads(target.read_text(encoding="utf-8"))
+except Exception:
+    data = {}
+with sqlite3.connect(legacy) as conn:
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='animes'").fetchone():
+        raise SystemExit(1)
+    for anime, ep, progress in conn.execute("SELECT anime,last_cap,progress FROM animes"):
+        try: ep = int(ep)
+        except Exception: ep = 1
+        data[f"legacy:{anime}"] = {"title": anime, "url": "", "provider": "jkanime", "last_episode": ep, "progress": progress or "0"}
+target.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+PY
+    mv -- "$LEGACY_DB" "$LEGACY_DB.migrated"
+}
+
+history_get_episode() { jq -r --arg key "$1" '.[$key].last_episode // empty' "$HISTORY_FILE"; }
+history_get_progress() { jq -r --arg key "$1" '.[$key].progress // "0"' "$HISTORY_FILE"; }
+
+history_save() {
+    local key="$1" title="$2" url="$3" episode="$4" progress="$5"
+    local tmp
+    tmp=$(mktemp "$STATE_DIR/history.XXXXXX") || return 1
+    if jq --arg key "$key" --arg title "$title" --arg url "$url" --arg provider "$PROVIDER" \
+        --argjson episode "$episode" --arg progress "$progress" \
+        '.[$key]={title:$title,url:$url,provider:$provider,last_episode:$episode,progress:$progress}' \
+        "$HISTORY_FILE" > "$tmp"; then
+        mv -- "$tmp" "$HISTORY_FILE"
+    else
+        rm -f -- "$tmp"
+        warn "No se pudo guardar el historial."
+    fi
+}
+
+urlencode_query() {
+    python3 - "$1" <<'PY'
+import sys
+from urllib.parse import quote_plus
+print(quote_plus(sys.argv[1]))
+PY
+}
+
+absolute_url() {
+    local value="$1" base="${2:-$BASE_URL}"
+    case "$value" in
+        http://*|https://*) printf '%s\n' "$value" ;;
+        //*) printf 'https:%s\n' "$value" ;;
+        /*) printf '%s%s\n' "$base" "$value" ;;
+        *) printf '%s/%s\n' "${base%/}" "$value" ;;
+    esac
+}
+
+http_get() {
+    local url="$1" referer="${2:-}"
+    case "$url" in http://*|https://*) ;; *) return 1 ;; esac
+    local args=(--fail --silent --show-error --location
+        --proto '=http,https' --proto-redir '=http,https'
+        --connect-timeout 15 --max-time "$HTTP_TIMEOUT" --retry 2 --retry-delay 1
+        --user-agent "$USER_AGENT")
+    [[ -n "$referer" ]] && args+=(--referer "$referer")
+    curl "${args[@]}" -- "$url"
+}
+
+# Extrae un array/objeto JavaScript suficientemente simple desde HTML de SvelteKit.
+# Primero intenta JSON puro; después normaliza notación JS común y usa ast.literal_eval.
+python_svelte_helpers=''
+
+av1_parse_search_results() {
+    local html_file="$1" payload_file="$WORKDIR/av1-search-payload.json"
+    av1_extract_payload "$html_file" > "$payload_file"
+    python3 - "$html_file" "$payload_file" "$BASE_URL" <<'PY'
+import html, json, re, sys
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+html_file, payload_file, base = sys.argv[1:4]
+page = Path(html_file).read_text(encoding="utf-8", errors="replace")
+try:
+    root = json.loads(Path(payload_file).read_text(encoding="utf-8"))
+except Exception:
+    root = {}
+
+def walk(value):
+    yield value
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from walk(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk(child)
+
+def normalize_result(item):
+    if not isinstance(item, dict):
+        return None
+    title = item.get("title") or item.get("name")
+    slug = item.get("slug")
+    raw_url = item.get("url") or item.get("href") or (f"/media/{slug}" if slug else None)
+    if not title or not raw_url:
+        return None
+    url = urljoin(base, str(raw_url))
+    if not re.fullmatch(r"/media/[^/]+", urlparse(url).path.rstrip("/")):
+        return None
+    return url, html.unescape(str(title)).strip()
+
+results = []
+for value in walk(root):
+    if not isinstance(value, list) or not value or len(value) > 500:
+        continue
+    candidates = [normalize_result(item) for item in value]
+    candidates = [item for item in candidates if item]
+    if candidates:
+        results.extend(candidates)
+
+class Parser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.current = None
+        self.results = []
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "a" and attrs.get("href"):
+            href = attrs["href"]
+            path = urlparse(urljoin(base, href)).path.rstrip("/")
+            if re.fullmatch(r"/media/[^/]+", path):
+                self.current = {"url": urljoin(base, href), "text": [], "alt": attrs.get("title", "")}
+        elif self.current and tag == "img":
+            self.current["alt"] = attrs.get("alt", self.current["alt"])
+    def handle_data(self, data):
+        if self.current:
+            self.current["text"].append(data)
+    def handle_endtag(self, tag):
+        if tag == "a" and self.current:
+            title = " ".join(" ".join(self.current["text"]).split()).strip()
+            if not title:
+                title = self.current["alt"].strip()
+            title = re.sub(r"^(?:Portada|Póster|Poster|Backdrop)\s+(?:de\s+)?", "", title, flags=re.I)
+            if title:
+                self.results.append((self.current["url"], html.unescape(title)))
+            self.current = None
+
+parser = Parser()
+parser.feed(page)
+results.extend(parser.results)
+
+seen = set()
+for url, title in results:
+    if url not in seen and title:
+        seen.add(url)
+        print(f"{url}\t{title}")
+PY
+}
+
+av1_extract_payload() {
+    python3 - "$1" <<'PY'
+import ast, json, re, sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+
+def balanced(src, start, op='[', cl=']'):
+    depth = 0; quote = None; esc = False
+    for i in range(start, len(src)):
+        ch = src[i]
+        if quote:
+            if esc: esc = False
+            elif ch == '\\': esc = True
+            elif ch == quote: quote = None
+            continue
+        if ch in "'\"`": quote = ch; continue
+        if ch == op: depth += 1
+        elif ch == cl:
+            depth -= 1
+            if depth == 0: return src[start:i+1]
+    return None
+
+candidates = []
+for pattern in (r"\b(?:const|let|var)\s+data\s*=", r"\bdata\s*:"):
+    for m in re.finditer(pattern, text):
+        start = text.find('[', m.end())
+        if start != -1:
+            expr = balanced(text, start)
+            if expr: candidates.append(expr)
+
+# Prioriza el payload de página sobre dependencias internas como data:["/auth"].
+candidates.sort(key=lambda x: (
+    sum(term in x for term in ("embeds", "downloads", "streamLinks", "episodes", "media", "variants")),
+    len(x),
+), reverse=True)
+
+def parse(expr):
+    try: return json.loads(expr)
+    except Exception: pass
+    cleaned = re.sub(r'([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)', r'\1"\2"\3', expr)
+    # SvelteKit serializa valores ausentes como `void 0`.
+    cleaned = re.sub(r'\bvoid\s+0\b|\bundefined\b|\bNaN\b', 'None', cleaned)
+    cleaned = re.sub(r'\bnull\b', 'None', cleaned)
+    cleaned = re.sub(r'\btrue\b', 'True', cleaned)
+    cleaned = re.sub(r'\bfalse\b', 'False', cleaned)
+    try: return ast.literal_eval(cleaned)
+    except Exception: return None
+
+for expr in candidates:
+    value = parse(expr)
+    if isinstance(value, (list, dict)):
+        print(json.dumps(value, ensure_ascii=False))
+        raise SystemExit(0)
+print('{}')
+PY
+}
+
+av1_parse_metadata() {
+    local html_file="$1" payload_file="$WORKDIR/av1-payload.json"
+    av1_extract_payload "$html_file" > "$payload_file"
+    python3 - "$html_file" "$payload_file" "$BASE_URL" <<'PY'
+import json, re, sys
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+html = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+try: root = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+except Exception: root = {}
+base = sys.argv[3]
+
+def walk(v):
+    yield v
+    if isinstance(v, dict):
+        for x in v.values(): yield from walk(x)
+    elif isinstance(v, list):
+        for x in v: yield from walk(x)
+
+best = None; score = -1
+for obj in walk(root):
+    if not isinstance(obj, dict): continue
+    s = 0
+    if isinstance(obj.get("title"), str): s += 3
+    if isinstance(obj.get("episodes"), list): s += 5
+    if obj.get("totalEpisodes") is not None: s += 3
+    if obj.get("slug"): s += 1
+    if s > score: best, score = obj, s
+best = best or {}
+
+episodes = []
+for key in ("episodes", "episodeList"):
+    val = best.get(key)
+    if isinstance(val, list):
+        for idx, ep in enumerate(val, 1):
+            if not isinstance(ep, dict): continue
+            n = ep.get("number", ep.get("episode", ep.get("ep", ep.get("order", idx))))
+            try: n = int(n)
+            except Exception: continue
+            url = ep.get("url") or ep.get("href") or ep.get("link")
+            if url: url = urljoin(base, str(url))
+            episodes.append((n, url or ""))
+
+# Fallback HTML: enlaces visibles de episodios.
+for href, num in re.findall(r'href=["\'](/media/[^/"\']+/(\d+))/?["\']', html, re.I):
+    episodes.append((int(num), urljoin(base, href)))
+
+unique = {}
+for n, url in episodes: unique[n] = url
+
+# Algunas películas de AnimeAV1 se publican como un único episodio número 0.
+# El selector humano sigue mostrando 1, pero conserva la ruta real terminada en /0.
+if len(unique) == 1 and 0 in unique:
+    unique = {1: unique[0]}
+
+total = best.get("totalEpisodes") or best.get("total_episodes") or best.get("episodesCount")
+try: total = int(total)
+except Exception: total = max(unique, default=0)
+
+type_value = best.get("type")
+if isinstance(best.get("category"), dict): type_value = best["category"].get("name", type_value)
+print(json.dumps({"title": best.get("title", ""), "type": type_value or "", "total": total, "episodes": unique}, ensure_ascii=False))
+PY
+}
+
+av1_parse_episode_links() {
+    local html_file="$1" payload_file="$WORKDIR/av1-episode-payload.json"
+    av1_extract_payload "$html_file" > "$payload_file"
+    python3 - "$html_file" "$payload_file" "$BASE_URL" <<'PY'
+import html as htmllib, json, re, sys
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+html = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+try: root = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+except Exception: root = {}
+base = sys.argv[3]
+
+def walk(v):
+    yield v
+    if isinstance(v, dict):
+        for x in v.values(): yield from walk(x)
+    elif isinstance(v, list):
+        for x in v: yield from walk(x)
+
+def normalize(entry, name=""):
+    if isinstance(entry, str): url = entry; quality = ""
+    elif isinstance(entry, dict):
+        url = next((entry.get(k) for k in ("url","href","link","embed","streamUrl","downloadUrl","file","source") if entry.get(k)), None)
+        name = entry.get("server") or entry.get("name") or entry.get("provider") or entry.get("host") or name
+        quality = entry.get("quality") or entry.get("resolution") or entry.get("label") or ""
+    else: return None
+    if not url: return None
+    url = urljoin(base, htmllib.unescape(str(url)).replace('\\/', '/'))
+    if not name:
+        name = urlparse(url).hostname or "desconocido"
+    return str(name), url, str(quality)
+
+def emit_container(container, kind):
+    if not isinstance(container, dict): return
+    for variant_key, value in container.items():
+        language = str(variant_key).lower()
+        if language not in ("sub", "dub"): continue
+        if isinstance(value, list):
+            for e in value:
+                item = normalize(e)
+                if item: yield language, kind, *item
+        elif isinstance(value, dict):
+            for child_name, child in value.items():
+                child_kind = "download" if "download" in child_name.lower() else kind
+                vals = child if isinstance(child, list) else [child]
+                for e in vals:
+                    item = normalize(e, child_name)
+                    if item: yield language, child_kind, *item
+        else:
+            item = normalize(value)
+            if item: yield language, kind, *item
+
+rows = []
+for obj in walk(root):
+    if not isinstance(obj, dict): continue
+    for key, kind in (("streamLinks","stream"),("downloadLinks","download"),("servers","stream"),
+                      ("embeds","stream"),("downloads","download")):
+        if key in obj: rows.extend(emit_container(obj[key], kind) or [])
+    if any(str(k).lower() in ("sub", "dub") for k in obj):
+        rows.extend(emit_container(obj, "stream") or [])
+
+# Fallback de URLs conocidas incrustadas directamente en el HTML.
+if not rows:
+    pattern = r'https?://[^\s"\'<>]+(?:pixeldrain|pdrain|mp4upload|mega\.nz|uns\.bio|upnshare|zilla|\.m3u8)[^\s"\'<>]*'
+    for url in re.findall(pattern, html, re.I):
+        rows.append(("sub", "stream", urlparse(url).hostname or "desconocido", htmllib.unescape(url), ""))
+
+seen = set()
+for row in rows:
+    # Un mismo contenedor SUB/DUB se vuelve a visitar durante el recorrido.
+    # Conserva la primera clasificación (embed antes que descarga) por URL.
+    key = (row[0], row[3])
+    if key in seen: continue
+    seen.add(key)
+    print("\t".join(str(x).replace("\t", " ") for x in row))
+PY
+}
+
+choose_from_results() {
+    local results="$1" prompt="$2" choice
+    [[ -n "$results" ]] || return 1
+    choice=$(printf '%s\n' "$results" | fzf --delimiter=$'\t' --with-nth=2 --prompt="$prompt" --height=~24 --border --reverse) || return 1
+    printf '%s\n' "$choice"
+}
+
+av1_search_anime() {
+    local query="$1" encoded html_file results key
+    encoded=$(urlencode_query "$query")
+    html_file="$WORKDIR/search.html"
+    for key in search q; do
+        info "Buscando ‘$query’ en AnimeAV1..."
+        if http_get "$BASE_URL/catalogo?$key=$encoded" > "$html_file"; then
+            results=$(av1_parse_search_results "$html_file")
+            [[ -n "$results" ]] && { choose_from_results "$results" "Selecciona un anime: "; return; }
+        fi
+    done
+    return 1
+}
+
+av1_get_episode_metadata() {
+    local anime_url="$1" html_file metadata
+    html_file="$WORKDIR/anime.html"
+    http_get "$anime_url" > "$html_file" || return 1
+    metadata=$(av1_parse_metadata "$html_file") || return 1
+    EPISODE_TOTAL=$(jq -r '.total // 0' <<<"$metadata")
+    ANIME_TYPE=$(jq -r '.type // ""' <<<"$metadata")
+    EPISODE_MAP_FILE="$WORKDIR/episode-map.tsv"
+    jq -r '.episodes // {} | to_entries[] | "\(.key)\t\(.value)"' <<<"$metadata" > "$EPISODE_MAP_FILE"
+    [[ "$EPISODE_TOTAL" =~ ^[0-9]+$ && "$EPISODE_TOTAL" -gt 0 ]]
+}
+
+server_token() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]'
+}
+
+server_rank() {
+    case "$(server_token "$1")" in
+        *pdrain*|*pixeldrain*) echo 10 ;;
+        *hls*|*zilla*) echo 20 ;;
+        *upnshare*|*unsbio*) echo 30 ;;
+        *mp4upload*) echo 40 ;;
+        *yourupload*) echo 50 ;;
+        *streamtape*) echo 60 ;;
+        *mega*) echo 90 ;;
+        *) echo 70 ;;
+    esac
+}
+
+media_url_is_plausible() {
+    local url="${1,,}"
+    case "$url" in
+        *.js|*.js\?*|*.css|*.css\?*|*.html|*.html\?*|*.htm|*.htm\?*|*.json|*.json\?*|*.png|*.jpg|*.jpeg|*.gif|*.svg|*.webp|*.woff|*.woff2|*.ttf)
+            return 1
+            ;;
+        *.m3u8|*.m3u8\?*|*.mp4|*.mp4\?*|*.mkv|*.mkv\?*|*.webm|*.webm\?*|*/api/file/*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+url_origin() {
+    python3 - "$1" <<'PYURL'
+import sys
+from urllib.parse import urlsplit
+u=urlsplit(sys.argv[1])
+print(f"{u.scheme}://{u.netloc}" if u.scheme and u.netloc else "")
+PYURL
+}
+
+cache_key() {
+    python3 - "$1" <<'PYCACHEKEY'
+import hashlib, sys
+print(hashlib.sha256(sys.argv[1].encode("utf-8")).hexdigest()[:12])
+PYCACHEKEY
+}
+
+# Salida de todos los resolutores: URL<TAB>Referer<TAB>Origin<TAB>Tipo
+resolve_zilla() {
+    local candidate="$1" id origin
+    origin=$(url_origin "$candidate")
+    if [[ "$candidate" =~ ^https?://player\.zilla-networks\.com/play/([^/?#]+) ]]; then
+        id="${BASH_REMATCH[1]}"
+        printf '%s\t%s\t%s\thls\n' "$origin/m3u8/$id" "$candidate" "$origin"
+        return 0
+    fi
+    if [[ "$candidate" =~ ^https?://player\.zilla-networks\.com/m3u8/([^/?#]+) ]]; then
+        printf '%s\t%s\t%s\thls\n' "$candidate" "$candidate" "$origin"
+        return 0
+    fi
+    return 1
+}
+
+resolve_pixeldrain() {
+    local candidate="$1" id
+    [[ "$candidate" =~ pixeldrain\.com/(u|l)/([A-Za-z0-9]+) ]] || return 1
+    id="${BASH_REMATCH[2]}"
+    printf 'https://pixeldrain.com/api/file/%s?download\t%s\t%s\tfile\n' "$id" "$candidate" "https://pixeldrain.com"
+}
+
+media_type_for_url() {
+    case "${1,,}" in
+        *.m3u8|*.m3u8\?*) printf 'hls\n' ;;
+        *) printf 'file\n' ;;
+    esac
+}
+
+resolve_generic_embed() {
+    local candidate="$1" referer="$2" page_file direct media_type
+    case "$candidate" in http://*|https://*) ;; *) return 1 ;; esac
+    page_file="$WORKDIR/embed-$(cache_key "$candidate").html"
+    if http_get "$candidate" "$referer" > "$page_file" 2>/dev/null; then
+        direct=$(python3 - "$page_file" <<'PYRESOLVE'
+import html, re, sys
+text=open(sys.argv[1],encoding='utf-8',errors='replace').read()
+patterns=[
+ r'https?://[^\s"\'<>]+\.m3u8(?:\?[^\s"\'<>]*)?(?=[\s"\'<>]|$)',
+ r'https?://[^\s"\'<>]+\.(?:mp4|mkv|webm)(?:\?[^\s"\'<>]*)?(?=[\s"\'<>]|$)',
+ r'(?:file|src|source)\s*[:=]\s*["\']([^"\']+\.(?:m3u8|mp4|mkv|webm)(?:\?[^"\']*)?)["\']',
+]
+for p in patterns:
+    m=re.search(p,text,re.I)
+    if m:
+        print(html.unescape(m.group(1) if m.lastindex else m.group(0)).replace('\\/','/'))
+        break
+PYRESOLVE
+) || true
+        if [[ -n "$direct" ]]; then
+            direct=$(absolute_url "$direct" "$candidate")
+            if media_url_is_plausible "$direct"; then
+                media_type=$(media_type_for_url "$direct")
+                printf '%s\t%s\t%s\t%s\n' "$direct" "$candidate" "$(url_origin "$candidate")" "$media_type"
+                return 0
+            fi
+        fi
+    fi
+
+    if command -v yt-dlp >/dev/null 2>&1; then
+        while IFS= read -r direct; do
+            [[ -n "$direct" ]] || continue
+            if media_url_is_plausible "$direct"; then
+                media_type=$(media_type_for_url "$direct")
+                printf '%s\t%s\t%s\t%s\n' "$direct" "$candidate" "$(url_origin "$candidate")" "$media_type"
+                return 0
+            fi
+        done < <(yt-dlp --no-warnings --no-playlist --referer "$referer" --get-url "$candidate" 2>/dev/null || true)
+    fi
+
+    return 1
+}
+
+resolve_candidate_url() {
+    local candidate="$1" referer="$2" media_type
+    case "${candidate,,}" in
+        *player.zilla-networks.com/play/*|*player.zilla-networks.com/m3u8/*)
+            resolve_zilla "$candidate"; return ;;
+        *pixeldrain.com/u/*|*pixeldrain.com/l/*)
+            resolve_pixeldrain "$candidate"; return ;;
+    esac
+    if media_url_is_plausible "$candidate"; then
+        media_type=$(media_type_for_url "$candidate")
+        printf '%s\t%s\t%s\t%s\n' "$candidate" "$referer" "$(url_origin "$candidate")" "$media_type"
+        return 0
+    fi
+    resolve_generic_embed "$candidate" "$referer"
+}
+
+probe_request() {
+    local media_type="$1" url="$2" referer="$3" origin="$4"
+    local key body_file headers_file curl_error_file result curl_status http_status content_type
+    case "$url" in
+        http://*|https://*) ;;
+        *) PROBE_REASON="protocolo no permitido"; return 1 ;;
+    esac
+    key=$(cache_key "$url")
+    body_file="$WORKDIR/probe-$key.body"
+    headers_file="$WORKDIR/probe-$key.headers"
+    curl_error_file="$WORKDIR/probe-$key.curl-error"
+    local args=(--silent --show-error --location
+        --proto '=http,https' --proto-redir '=http,https'
+        --connect-timeout 15 --max-time "$HTTP_TIMEOUT"
+        --range 0-1023 --max-filesize 262144 --user-agent "$USER_AGENT"
+        --referer "${referer:-$url}" --dump-header "$headers_file" --output "$body_file"
+        --write-out $'%{http_code}\t%{content_type}')
+    [[ -n "$origin" ]] && args+=(--header "Origin: $origin")
+
+    result=$(curl "${args[@]}" -- "$url" 2> "$curl_error_file") && curl_status=0 || curl_status=$?
+    IFS=$'\t' read -r http_status content_type <<<"$result"
+    PROBE_HTTP_STATUS="${http_status:-000}"
+    PROBE_CONTENT_TYPE="${content_type:-desconocido}"
+    debug "probe tipo=$media_type HTTP=$PROBE_HTTP_STATUS Content-Type=$PROBE_CONTENT_TYPE curl=$curl_status"
+    if [[ "$DEBUG" == "1" && -s "$curl_error_file" ]]; then
+        debug "curl: $(redact_sensitive_text "$(cat "$curl_error_file")")"
+    fi
+
+    if ((curl_status != 0)); then
+        PROBE_REASON="curl falló con código $curl_status"; return 1
+    fi
+    if [[ "$PROBE_HTTP_STATUS" != "200" && "$PROBE_HTTP_STATUS" != "206" ]]; then
+        PROBE_REASON="HTTP $PROBE_HTTP_STATUS"; return 1
+    fi
+    if [[ "$media_type" == "hls" ]]; then
+        if [[ "${PROBE_CONTENT_TYPE,,}" =~ (text/html|application/json|javascript|text/css) ]]; then
+            PROBE_REASON="Content-Type incompatible: $PROBE_CONTENT_TYPE"; return 1
+        fi
+        if ! grep -aFq '#EXTM3U' "$body_file"; then
+            PROBE_REASON="la respuesta no es un manifiesto HLS (#EXTM3U ausente)"; return 1
+        fi
+        if [[ "$DEBUG" == "1" ]]; then
+            debug "manifiesto: $(grep -a '^#' "$body_file" | head -n 4 | tr '\n' ' ')"
+        fi
+    else
+        if [[ ! "${PROBE_CONTENT_TYPE,,}" =~ ^(video/|audio/|application/octet-stream|binary/octet-stream) ]]; then
+            if ! python3 - "$body_file" <<'PYMAGIC'
+import sys
+p=open(sys.argv[1], 'rb').read(64)
+raise SystemExit(0 if (b'ftyp' in p[:32] or p.startswith(b'\x1aE\xdf\xa3')) else 1)
+PYMAGIC
+            then
+                PROBE_REASON="Content-Type no multimedia: $PROBE_CONTENT_TYPE"; return 1
+            fi
+        fi
+    fi
+    PROBE_REASON="válido"
+    return 0
+}
+
+probe_hls_url() { probe_request hls "$1" "$2" "$3"; }
+probe_direct_media_url() { probe_request file "$1" "$2" "$3"; }
+probe_media_url() {
+    case "$4" in
+        hls) probe_hls_url "$1" "$2" "$3" ;;
+        file) probe_direct_media_url "$1" "$2" "$3" ;;
+        *) PROBE_REASON="tipo de medio desconocido: $4"; return 1 ;;
+    esac
+}
+
+server_matches_request() {
+    local requested="$1" token="$2"
+    [[ -z "$requested" || "$requested" == "auto" ]] && return 0
+    case "$requested" in
+        hls|zilla) [[ "$token" == *hls* || "$token" == *zilla* ]] ;;
+        pdrain|pixeldrain) [[ "$token" == *pdrain* || "$token" == *pixeldrain* ]] ;;
+        upnshare|unsbio) [[ "$token" == *upnshare* || "$token" == *unsbio* ]] ;;
+        *) [[ "$token" == *"$requested"* ]] ;;
+    esac
+}
+
+# Devuelve todos los candidatos resolubles, en orden de preferencia.
+av1_resolve_video_candidates() {
+    local episode_url="$1" html_file links_file candidates language kind server url quality token requested rank resolved
+    local language_count=0 filtered_count=0 resolved_count=0 available_servers="" available_server_keys=","
+    html_file="$WORKDIR/episode.html"
+    links_file="$WORKDIR/episode-links.tsv"
+    RESOLVE_STATUS_FILE="${RESOLVE_STATUS_FILE:-$WORKDIR/resolve-status}"
+    RESOLVE_FAILURES_FILE="${RESOLVE_FAILURES_FILE:-$WORKDIR/resolve-failures.tsv}"
+    : > "$RESOLVE_FAILURES_FILE"
+    printf 'FETCH_FAILED\n' > "$RESOLVE_STATUS_FILE"
+    debug "episode_url=$(redact_url "$episode_url")"
+    debug "language=$LANGUAGE server=$PREFERRED_SERVER"
+    http_get "$episode_url" > "$html_file" || {
+        printf 'AnimeAV1\tno se pudo descargar la página del episodio\n' >> "$RESOLVE_FAILURES_FILE"
+        return 1
+    }
+    av1_parse_episode_links "$html_file" > "$links_file"
+    if [[ ! -s "$links_file" ]]; then
+        printf 'NO_LINKS\n' > "$RESOLVE_STATUS_FILE"
+        printf 'AnimeAV1\tla página no contiene enlaces reconocibles\n' >> "$RESOLVE_FAILURES_FILE"
+        return 1
+    fi
+
+    if [[ "$DEBUG" == "1" ]]; then
+        while IFS=$'\t' read -r language kind server url quality; do
+            debug "enlace: $language $kind $server $(redact_url "$url") ${quality:+calidad=$quality}"
+        done < "$links_file"
+    fi
+
+    requested=$(server_token "$PREFERRED_SERVER")
+    candidates="$WORKDIR/candidates.tsv"
+    : > "$candidates"
+    while IFS=$'\t' read -r language kind server url quality; do
+        [[ "$language" == "$LANGUAGE" ]] || continue
+        ((language_count += 1))
+        if [[ "$available_server_keys" != *",$server,"* ]]; then
+            available_servers+="${available_servers:+, }$server"
+            available_server_keys+="$server,"
+        fi
+        token=$(server_token "$server $url")
+        if ! server_matches_request "$requested" "$token"; then
+            continue
+        fi
+        ((filtered_count += 1))
+        rank=$(server_rank "$server $url")
+        [[ "$kind" == "download" ]] && rank=$((rank + 5))
+        printf '%03d\t%s\t%s\t%s\n' "$rank" "$server" "$kind" "$url" >> "$candidates"
+    done < "$links_file"
+
+    if ((language_count == 0)); then
+        printf 'NO_VARIANT\n' > "$RESOLVE_STATUS_FILE"
+        return 1
+    fi
+    if ((filtered_count == 0)); then
+        printf 'NO_SERVER_MATCH\n' > "$RESOLVE_STATUS_FILE"
+        printf '%s\tno está disponible para %s; servidores detectados: %s\n' "$PREFERRED_SERVER" "$LANGUAGE" "${available_servers:-ninguno}" >> "$RESOLVE_FAILURES_FILE"
+        return 1
+    fi
+
+    while IFS=$'\t' read -r _rank server kind url; do
+        debug "candidato: $server/$kind $(redact_url "$url")"
+        resolved=$(resolve_candidate_url "$url" "$episode_url") || true
+        if [[ -z "$resolved" ]]; then
+            printf '%s\tno se encontró una URL multimedia directa\n' "$server" >> "$RESOLVE_FAILURES_FILE"
+            continue
+        fi
+        ((resolved_count += 1))
+        debug "transformado: $server $(redact_url "${resolved%%$'\t'*}")"
+        printf '%s\t%s\n' "$server" "$resolved"
+    done < <(sort -n "$candidates")
+    if ((resolved_count > 0)); then
+        printf 'READY\n' > "$RESOLVE_STATUS_FILE"
+    else
+        printf 'NO_RESOLVED\n' > "$RESOLVE_STATUS_FILE"
+    fi
+}
+
+
+# --- Proveedor JKAnime conservado como respaldo ---
+
+jk_parse_search_results() {
+    python3 - "$1" <<'PY'
+import html,re,sys
+from pathlib import Path
+from urllib.parse import urljoin
+page=Path(sys.argv[1]).read_text(encoding='utf-8',errors='replace')
+pat=re.compile(r'<h5[^>]*>\s*<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>\s*</h5>',re.I|re.S)
+seen=set()
+for href,raw in pat.findall(page):
+ title=html.unescape(re.sub(r'<[^>]+>','',raw));title=' '.join(title.split())
+ url=urljoin('https://jkanime.net/',href)
+ if title and url not in seen: seen.add(url);print(f'{url}\t{title}')
+PY
+}
+
+jk_search_anime() {
+    local query="$1" encoded file results
+    encoded=$(python3 - "$query" <<'PY'
+import sys
+from urllib.parse import quote
+print(quote(sys.argv[1].replace(' ','_'),safe='_-'))
+PY
+)
+    file="$WORKDIR/search.html"
+    info "Buscando ‘$query’ en JKAnime..."
+    http_get "$BASE_URL/buscar/$encoded/" > "$file" || return 1
+    results=$(jk_parse_search_results "$file")
+    choose_from_results "$results" "Selecciona un anime: "
+}
+
+jk_get_episode_metadata() {
+    local anime_url="$1" page_file metadata csrf api response total
+    page_file="$WORKDIR/anime.html"
+    curl --fail --silent --show-error --location --proto '=http,https' --proto-redir '=http,https' \
+        --user-agent "$USER_AGENT" --cookie-jar "$WORKDIR/cookies.txt" --output "$page_file" -- "$anime_url" || return 1
+    metadata=$(python3 - "$page_file" <<'PY'
+import html,json,re,sys
+p=open(sys.argv[1],encoding='utf-8',errors='replace').read()
+def f(x,d=''):
+ m=re.search(x,p,re.I|re.S);return html.unescape(m.group(1)).strip() if m else d
+print(json.dumps({'csrf':f(r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)'),'api':f(r"url\s*:\s*['\"](https://jkanime\.net/ajax/episodes/\d+/?)[\"']"),'type':f(r'<span>\s*Tipo:\s*</span>\s*([^<]+)'),'episodes':f(r'<span>\s*Episodios:\s*</span>\s*(\d+)')}))
+PY
+)
+    csrf=$(jq -r '.csrf' <<<"$metadata"); api=$(jq -r '.api' <<<"$metadata"); ANIME_TYPE=$(jq -r '.type' <<<"$metadata"); total=$(jq -r '.episodes' <<<"$metadata")
+    if [[ -n "$csrf" && -n "$api" ]]; then
+        response=$(curl --fail --silent --show-error --location --proto '=http,https' --proto-redir '=http,https' \
+            --user-agent "$USER_AGENT" --cookie "$WORKDIR/cookies.txt" --header 'X-Requested-With: XMLHttpRequest' \
+            --header "X-CSRF-TOKEN: $csrf" --data-urlencode "_token=$csrf" -- "$api") || response=""
+        [[ -n "$response" ]] && total=$(jq -r '.total // empty' <<<"$response" 2>/dev/null)
+    fi
+    [[ "$total" =~ ^[0-9]+$ && "$total" -gt 0 ]] || return 1
+    EPISODE_TOTAL="$total"
+}
+
+jk_resolve_video_candidates() {
+    local episode_url="$1" file resolved iframe
+    file="$WORKDIR/jk-episode.html"
+    http_get "$episode_url" > "$file" || return 1
+    while IFS= read -r iframe; do
+        [[ -n "$iframe" ]] || continue
+        resolved=$(resolve_candidate_url "$iframe" "$episode_url") || true
+        [[ -n "$resolved" ]] && printf 'JKAnime\t%s\n' "$resolved"
+    done < <(python3 - "$file" <<'PYJK'
+import html,re,sys
+from urllib.parse import urljoin
+p=open(sys.argv[1],encoding='utf-8',errors='replace').read()
+for x in re.findall(r'<iframe[^>]+src=["\']([^"\']+)',p,re.I):
+    print(urljoin('https://jkanime.net/',html.unescape(x)))
+PYJK
+)
+}
+
+provider_search_anime() {
+    case "$PROVIDER" in animeav1) av1_search_anime "$1" ;; jkanime) jk_search_anime "$1" ;; esac
+}
+
+provider_get_episode_metadata() {
+    case "$PROVIDER" in animeav1) av1_get_episode_metadata "$1" ;; jkanime) jk_get_episode_metadata "$1" ;; esac
+}
+
+provider_episode_url() {
+    local anime_url="$1" episode="$2" mapped=""
+    case "$PROVIDER" in
+        animeav1)
+            if [[ -n "$EPISODE_MAP_FILE" && -f "$EPISODE_MAP_FILE" ]]; then
+                mapped=$(awk -F '\t' -v ep="$episode" '$1 == ep {print $2; exit}' "$EPISODE_MAP_FILE")
+            fi
+            if [[ -n "$mapped" ]]; then printf '%s\n' "$mapped"; else printf '%s/%s\n' "${anime_url%/}" "$episode"; fi
+            ;;
+        jkanime)
+            if [[ "$ANIME_TYPE" =~ [Pp]el[ií]cula ]]; then printf '%s/pelicula\n' "${anime_url%/}"; else printf '%s/%s\n' "${anime_url%/}" "$episode"; fi
+            ;;
+    esac
+}
+
+provider_resolve_video_candidates() {
+    local episode_url="$1" direct
+    case "$PROVIDER" in
+        animeav1)
+            av1_resolve_video_candidates "$episode_url"
+            ;;
+        jkanime)
+            jk_resolve_video_candidates "$episode_url"
+            ;;
+    esac
+}
+
+normalize_playback_position() {
+    local value="$1"
+    awk -F: '
+        NF == 3 {seconds=($1 * 3600) + ($2 * 60) + $3}
+        NF == 2 {seconds=($1 * 60) + $2}
+        NF == 1 {seconds=$1}
+        END {
+            if (seconds == "") exit 1
+            printf "%.3f\n", seconds
+        }
+    ' <<<"$value" | sed -E 's/([.]0+)$//; s/([.][0-9]*[1-9])0+$/\1/'
+}
+
+play_episode() {
+    local title="$1" anime_url="$2" episode="$3" start="$4"
+    local episode_url player output_file output="" position player_status resolve_status
+    local server video_url media_referer media_origin media_type success=0 candidate_count=0
+    episode_url=$(provider_episode_url "$anime_url" "$episode")
+    info "Resolviendo episodio $episode ($LANGUAGE)..."
+    debug "anime_url=$(redact_url "$anime_url")"
+    debug "episode_url=$(redact_url "$episode_url")"
+    debug "language=$LANGUAGE"
+
+    player="${ANI_ES_PLAYER:-mpv}"
+    local extra_flags=()
+    [[ -n "${ANI_ES_PLAYER_FLAGS:-}" ]] && read -r -a extra_flags <<<"$ANI_ES_PLAYER_FLAGS"
+    output_file="$WORKDIR/player-output.txt"
+    RESOLVE_STATUS_FILE="$WORKDIR/resolve-status"
+    RESOLVE_FAILURES_FILE="$WORKDIR/resolve-failures.tsv"
+    rm -f -- "$RESOLVE_STATUS_FILE" "$RESOLVE_FAILURES_FILE"
+
+    while IFS=$'\t' read -r server video_url media_referer media_origin media_type; do
+        [[ -n "$video_url" ]] || continue
+        ((candidate_count += 1))
+        [[ -n "$media_type" ]] || media_type=$(media_type_for_url "$video_url")
+        info "Validando servidor $server..."
+        debug "candidato elegido=$server tipo=$media_type URL=$(redact_url "$video_url")"
+        debug "Referer=$(redact_url "${media_referer:-$episode_url}")"
+        debug "Origin=${media_origin:-ninguno}"
+
+        if ! probe_media_url "$video_url" "${media_referer:-$episode_url}" "$media_origin" "$media_type"; then
+            warn "$server descartado: $PROBE_REASON."
+            printf '%s\t%s\n' "$server" "$PROBE_REASON" >> "$RESOLVE_FAILURES_FILE"
+            continue
+        fi
+
+        info "Probando servidor $server..."
+        : > "$output_file"
+
+        local header_flags=(--user-agent="$USER_AGENT" --referrer="${media_referer:-$episode_url}")
+        if [[ -n "$media_origin" ]]; then
+            header_flags+=(--http-header-fields="Origin: $media_origin")
+        fi
+
+        local statuses=()
+        if "$player" --no-ytdl --start="${start:-0}" \
+            --force-media-title="$title — episodio $episode" \
+            --term-status-msg='ANI_ES_TIME=${playback-time}' \
+            "${header_flags[@]}" "${extra_flags[@]}" "$video_url" \
+            2>&1 | tr '\r' '\n' > "$output_file"; then
+            statuses=("${PIPESTATUS[@]}")
+        else
+            statuses=("${PIPESTATUS[@]}")
+        fi
+        player_status=${statuses[0]}
+        output=$(cat -- "$output_file")
+        debug "mpv terminó con código $player_status"
+        if [[ "$DEBUG" == "1" && -n "$output" ]]; then
+            printf '%s\n' "$(redact_sensitive_text "$output")" >&2
+        fi
+        position=$(sed -nE 's/.*ANI_ES_TIME=([0-9:.]+).*/\1/p' <<<"$output" | tail -n1)
+        [[ -n "$position" ]] && position=$(normalize_playback_position "$position" || true)
+        [[ -n "$position" ]] && LAST_POSITION="$position"
+
+        if ((player_status == 0)); then
+            success=1
+            break
+        fi
+
+        if ((player_status == 130 || player_status == 143)); then
+            [[ "$DEBUG" == "1" ]] || printf '%s\n' "$(redact_sensitive_text "$output")" >&2
+            return "$player_status"
+        fi
+
+        warn "$server falló con código $player_status; probando otra fuente."
+        printf '%s\tmpv terminó con código %s\n' "$server" "$player_status" >> "$RESOLVE_FAILURES_FILE"
+    done < <(provider_resolve_video_candidates "$episode_url")
+
+    if ((success == 0)); then
+        resolve_status=$(cat "$RESOLVE_STATUS_FILE" 2>/dev/null || printf 'NO_RESOLVED')
+        if [[ "$resolve_status" == "NO_VARIANT" ]]; then
+            if [[ "$LANGUAGE" == "dub" ]]; then
+                warn "El episodio $episode no tiene versión doblada disponible en AnimeAV1."
+            else
+                warn "El episodio $episode no tiene versión subtitulada disponible en AnimeAV1."
+            fi
+            return 3
+        fi
+
+        warn "No se pudo reproducir el episodio $episode."
+        if [[ -s "$RESOLVE_FAILURES_FILE" ]]; then
+            awk -F '\t' '!seen[$0]++ {printf "- %s: %s\n", $1, $2}' "$RESOLVE_FAILURES_FILE" >&2
+        elif ((candidate_count == 0)); then
+            printf '%s\n' '- AnimeAV1: no devolvió candidatos resolubles.' >&2
+        fi
+        return 4
+    fi
+    return 0
+}
+
+choose_episode() {
+    local total="$1"
+    seq 1 "$total" | fzf --prompt="Episodio: " --height=~30 --border --reverse
+}
+
+update_self() {
+    local update_url="${ANI_ES_UPDATE_URL:-}" expected_sha="${ANI_ES_UPDATE_SHA256:-}" target tmp actual_sha
+    [[ -n "$update_url" ]] || die "Define ANI_ES_UPDATE_URL antes de usar --update."
+    [[ "$expected_sha" =~ ^[A-Fa-f0-9]{64}$ ]] || die "Define ANI_ES_UPDATE_SHA256 con el SHA-256 publicado de la versión."
+    python3 - "$update_url" <<'PYUPDATEURL' || die "ANI_ES_UPDATE_URL debe ser una URL HTTPS sin credenciales incrustadas."
+import sys
+from urllib.parse import urlsplit
+url = urlsplit(sys.argv[1])
+if url.scheme != "https" or not url.hostname or url.username or url.password:
+    raise SystemExit(1)
+PYUPDATEURL
+    target=$(python3 - "$0" <<'PYTARGET'
+from pathlib import Path
+import sys
+print(Path(sys.argv[1]).resolve())
+PYTARGET
+)
+    [[ -w "$target" ]] || die "No se puede escribir $target. Instálalo en ~/.local/bin."
+    tmp=$(mktemp "${target}.update.XXXXXX") || die "No se pudo crear el temporal."
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+        --max-filesize 1048576 --output "$tmp" -- "$update_url" || { rm -f "$tmp"; die "Falló la descarga."; }
+    actual_sha=$(python3 - "$tmp" <<'PYSHAFILE'
+import hashlib, sys
+with open(sys.argv[1], "rb") as source:
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PYSHAFILE
+)
+    [[ "${actual_sha,,}" == "${expected_sha,,}" ]] || { rm -f -- "$tmp"; die "El SHA-256 de la actualización no coincide."; }
+    grep -q '^#!/usr/bin/env bash' "$tmp" && grep -q '^VERSION=' "$tmp" \
+        && grep -Fq 'ANI_ES_PROJECT="ani-es-animeav1"' "$tmp" && bash -n "$tmp" \
+        || { rm -f "$tmp"; die "Actualización inválida."; }
+    chmod 0755 "$tmp"
+    mv -- "$tmp" "$target"
+    info "ani-es actualizado y verificado."
+}
+
+main() {
+    while (($#)); do
+        case "$1" in
+            -c|--continue) CONTINUE=1 ;;
+            -p|--provider) [[ $# -ge 2 ]] || die "Falta proveedor"; PROVIDER="$2"; shift ;;
+            --sub) LANGUAGE="sub" ;;
+            --dub) LANGUAGE="dub" ;;
+            --server) [[ $# -ge 2 ]] || die "Falta servidor"; PREFERRED_SERVER="$2"; shift ;;
+            --debug) DEBUG=1 ;;
+            --keep-workdir) KEEP_WORKDIR=1 ;;
+            -u|--update) update_self; exit 0 ;;
+            -v|--version) provider_init; show_version; exit 0 ;;
+            -h|--help) show_help; exit 0 ;;
+            --) shift; QUERY="$*"; break ;;
+            -*) die "Opción desconocida: $1" ;;
+            *) QUERY+="${QUERY:+ }$1" ;;
+        esac
+        shift
+    done
+
+    provider_init
+    check_dependencies
+    init_state
+    WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/ani-es.XXXXXX") || die "No se pudo crear el directorio temporal."
+
+    if [[ -z "$QUERY" ]]; then read -r -p "Buscar anime: " QUERY; fi
+    [[ -n "$QUERY" ]] || die "La búsqueda está vacía."
+
+    local selection anime_url anime_title history_key total episode progress option
+    selection=$(provider_search_anime "$QUERY") || die "No se encontraron resultados en $PROVIDER."
+    anime_url=${selection%%$'\t'*}; anime_title=${selection#*$'\t'}
+    debug "anime_url=$(redact_url "$anime_url")"
+    history_key="$PROVIDER:$LANGUAGE:$anime_url"
+
+    provider_get_episode_metadata "$anime_url" || die "No se pudo obtener el listado de episodios de $anime_url"
+    total="$EPISODE_TOTAL"
+    info "$anime_title — $total episodio(s) — $PROVIDER/$LANGUAGE"
+
+    if ((CONTINUE)); then
+        episode=$(history_get_episode "$history_key"); progress=$(history_get_progress "$history_key")
+        if [[ ! "$episode" =~ ^[0-9]+$ || "$episode" -lt 1 || "$episode" -gt "$total" ]]; then
+            warn "No existe progreso válido; selecciona un episodio."
+            episode=$(choose_episode "$total") || exit 0; progress=0
+        fi
+    else
+        episode=$(choose_episode "$total") || exit 0; progress=0
+    fi
+
+    while :; do
+        LAST_POSITION=0
+        if play_episode "$anime_title" "$anime_url" "$episode" "$progress"; then
+            :
+        else
+            local play_status=$?
+            debug "play_episode terminó con estado $play_status"
+            warn "Volviendo al selector de episodios."
+            episode=$(choose_episode "$total") || exit 0
+            progress=0
+            continue
+        fi
+        history_save "$history_key" "$anime_title" "$anime_url" "$episode" "$LAST_POSITION"
+        option=$(printf '%s\n' "Siguiente" "Anterior" "Repetir" "Volver a episodios" "Salir" | fzf --prompt="Después del episodio $episode: " --height=9 --border --reverse) || exit 0
+        case "$option" in
+            Siguiente) ((episode < total)) && { ((episode++)); progress=0; } || warn "Último episodio." ;;
+            Anterior) ((episode > 1)) && { ((episode--)); progress=0; } || warn "Primer episodio." ;;
+            Repetir) progress=0 ;;
+            "Volver a episodios") episode=$(choose_episode "$total") || exit 0; progress=0 ;;
+            *) exit 0 ;;
+        esac
+    done
+}
+
+if [[ "${ANI_ES_SOURCE_ONLY:-0}" != "1" ]]; then
+    main "$@"
+fi

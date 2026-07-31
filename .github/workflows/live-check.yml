@@ -1,0 +1,30 @@
+name: Comprobación en vivo
+
+on:
+  workflow_dispatch:
+    inputs:
+      language:
+        description: Variante de audio
+        required: true
+        default: dub
+        type: choice
+        options:
+          - dub
+          - sub
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install --yes jq yt-dlp
+      - name: Check external provider
+        env:
+          ANI_ES_LIVE_LANGUAGE: ${{ inputs.language }}
+        run: make integration

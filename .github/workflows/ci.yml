@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install test dependency
+        run: sudo apt-get update && sudo apt-get install --yes jq
+      - name: Test
+        run: make test
+      - name: Audit publication contents
+        run: make audit
+
+  release-reproducibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Install test dependency
+        run: sudo apt-get update && sudo apt-get install --yes jq
+      - name: Build twice and compare
+        shell: bash
+        run: |
+          make release
+          first=$(cut -d ' ' -f 1 dist/*.sha256)
+          make release
+          second=$(cut -d ' ' -f 1 dist/*.sha256)
+          test "$first" = "$second"
+          make verify-release

@@ -1,0 +1,10 @@
+/dist/
+/.cache/
+/.env
+/.env.*
+*.log
+*.tmp
+*.swp
+*~
+__pycache__/
+.DS_Store
