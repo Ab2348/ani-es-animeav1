@@ -24,7 +24,7 @@ cmp "$ROOT/ani-es" "$INSTALL_BIN/ani-es"
 [[ $("$INSTALL_BIN/ani-es" --version) == 'ani-es v2.0.0 — proveedor animeav1' ]]
 PATH="$FAKE_BIN:$PATH" ANI_ES_INSTALL_DIR="$INSTALL_BIN" "$ROOT/install.sh" >/dev/null
 
-path_message=$(PATH="$FAKE_BIN:/usr/bin:/bin" ANI_ES_INSTALL_DIR="$INSTALL_BIN" "$ROOT/install.sh")
+path_message=$(PATH="$FAKE_BIN:$PATH" ANI_ES_INSTALL_DIR="$INSTALL_BIN" "$ROOT/install.sh")
 printf '%s\n' "$path_message" | grep -F 'export PATH=' >/dev/null
 printf '%s\n' "$path_message" | grep -F '\ ' >/dev/null
 
