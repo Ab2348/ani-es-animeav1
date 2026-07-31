@@ -14,12 +14,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
       - name: Install test dependency
         run: sudo apt-get update && sudo apt-get install --yes jq
       - name: Test
         run: make test
       - name: Audit publication contents
         run: make audit
+
+  macos-portability:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Install Bash and jq
+        run: brew install bash jq
+      - name: Test with Homebrew Bash
+        run: |
+          export PATH="$(brew --prefix bash)/bin:$PATH"
+          make test
+          make audit
 
   release-reproducibility:
     runs-on: ubuntu-24.04

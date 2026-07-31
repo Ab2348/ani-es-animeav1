@@ -17,7 +17,10 @@ case "${1:-}" in
         ;;
 esac
 
-if [[ -e "$TARGET" ]]; then
+if [[ -L "$TARGET" ]]; then
+    printf 'Se rechazó eliminar %s porque es un enlace simbólico.\n' "$TARGET" >&2
+    exit 1
+elif [[ -e "$TARGET" ]]; then
     if ! grep -Fq 'ANI_ES_PROJECT="ani-es-animeav1"' "$TARGET"; then
         printf 'Se rechazó eliminar %s: no pertenece a ani-es-animeav1.\n' "$TARGET" >&2
         exit 1

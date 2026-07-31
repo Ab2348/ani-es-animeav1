@@ -15,4 +15,5 @@ Primera versión pública independiente de `ani-es-animeav1`.
 - Soporte para películas publicadas como episodio `0`.
 - Historial atómico bajo XDG y migración de formatos anteriores.
 - Instalación sin `sudo`, actualización con SHA-256 obligatorio y desinstalación defensiva.
+- Artefacto ejecutable independiente para que `--update` pueda consumir releases verificadas.
 - Pruebas locales sin Internet e integración en vivo opcional.
