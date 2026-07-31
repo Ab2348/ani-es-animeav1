@@ -152,7 +152,7 @@ provider_init() {
 
 check_dependencies() {
     local missing=() command_name
-    for command_name in curl fzf grep sed jq python3; do
+    for command_name in curl fzf grep sed awk sort jq python3 mktemp head tail tr date; do
         command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
     done
 
@@ -1099,8 +1099,10 @@ play_episode() {
 }
 
 choose_episode() {
-    local total="$1"
-    seq 1 "$total" | fzf --prompt="Episodio: " --height=~30 --border --reverse
+    local total="$1" episode
+    for ((episode = 1; episode <= total; episode++)); do
+        printf '%s\n' "$episode"
+    done | fzf --prompt="Episodio: " --height=~30 --border --reverse
 }
 
 update_self() {

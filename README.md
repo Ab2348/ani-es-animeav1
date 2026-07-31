@@ -22,12 +22,14 @@ Se admite:
 
 - Linux con Bash 4 o posterior.
 - WSL con Bash 4 o posterior y un reproductor funcional.
-- macOS con una versión moderna de Bash instalada mediante Homebrew u otro gestor.
+
+> [!WARNING]
+> El soporte completo de macOS está pendiente. El instalador se valida con Bash de Homebrew, pero la suite HTTP y de reproducción aún no se considera bloqueante en esa plataforma.
 
 Dependencias requeridas:
 
 ```text
-bash >= 4, curl, fzf, grep, sed, awk, sort, jq, python3, mpv
+bash >= 4, curl, fzf, grep, sed, awk, sort, jq, python3, mpv y utilidades estándar del sistema
 ```
 
 Dependencias opcionales recomendadas:
@@ -36,7 +38,7 @@ Dependencias opcionales recomendadas:
 yt-dlp, ffmpeg
 ```
 
-El instalador comprueba dependencias, pero nunca ejecuta el gestor de paquetes ni usa `sudo`. Ejemplos de instalación manual:
+El instalador comprueba las dependencias, incluido el reproductor indicado por `ANI_ES_PLAYER`, pero nunca ejecuta el gestor de paquetes ni usa `sudo`. Ejemplos de instalación manual:
 
 ```bash
 # Debian/Ubuntu
@@ -129,15 +131,15 @@ Cada búsqueda comienza en DUB de forma deliberada. Usa `--sub` cuando el doblaj
 
 ## Actualizaciones verificadas
 
-`--update` está deshabilitado hasta proporcionar tanto la URL HTTPS como el SHA-256 publicado del ejecutable:
+`--update` está deshabilitado hasta proporcionar tanto la URL HTTPS como el SHA-256 publicado del ejecutable independiente. No uses para ello el `.tar.gz`:
 
 ```bash
-ANI_ES_UPDATE_URL="$release_asset_url" \
-ANI_ES_UPDATE_SHA256="$release_sha256" \
+ANI_ES_UPDATE_URL="https://github.com/ORGANIZACION/REPOSITORIO/releases/download/v2.0.0/ani-es-2.0.0" \
+ANI_ES_UPDATE_SHA256="SHA256_PUBLICADO_EN_ani-es-2.0.0.sha256" \
 ani-es --update
 ```
 
-Define `release_asset_url` y `release_sha256` con los valores de la versión publicada que quieras instalar.
+Sustituye la organización, el repositorio, la versión y el SHA-256 por los valores de la versión publicada que quieras instalar.
 
 La actualización se rechaza si el checksum, la cabecera o la sintaxis Bash no coinciden. Para máxima reproducibilidad se recomienda instalar desde una versión etiquetada y verificar los archivos de `dist/`.
 
@@ -147,6 +149,8 @@ Quien mantenga el proyecto puede crear y comprobar el paquete reproducible con:
 make release
 make verify-release
 ```
+
+El release genera cuatro archivos: el paquete `ani-es-animeav1-VERSION.tar.gz`, su checksum, el ejecutable actualizable `ani-es-VERSION` y su checksum.
 
 ## Estado, privacidad y depuración
 
@@ -181,6 +185,7 @@ ANI_ES_LIVE_LANGUAGE=dub ANI_ES_LIVE_SERVER=mp4upload ./tests/integration-live.s
 ## Limitaciones
 
 - Los sitios y hosts externos pueden cambiar o dejar de estar disponibles.
+- El soporte completo de macOS está pendiente; actualmente sólo se garantiza la validación del instalador.
 - UPNShare y Mega pueden requerir JavaScript o clientes específicos; `auto` intenta otros servidores.
 - La ficha general de AnimeAV1 no siempre declara variantes por episodio; se comprueban al elegirlo.
 - Algunas películas usan internamente el episodio `0`; el selector muestra `1` y conserva la URL real.
