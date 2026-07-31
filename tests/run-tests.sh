@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "$0")/.." && pwd)
 export ANI_ES_SOURCE_ONLY=1 ANI_ES_HTTP_TIMEOUT=5
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1,localhost"
+export no_proxy="${no_proxy:+$no_proxy,}127.0.0.1,localhost"
 # shellcheck source=/dev/null
 source "$ROOT/ani-es"
 WORKDIR=$(mktemp -d)
@@ -87,17 +89,28 @@ printf 'Pruebas de parser y resolutores: OK\n'
 # Servidor local: los probes nunca dependen de Internet.
 PORT_FILE="$WORKDIR/http-port"
 RANGE_LOG="$WORKDIR/range.log"
-python3 "$ROOT/tests/http-fixture-server.py" "$PORT_FILE" "$RANGE_LOG" &
+SERVER_LOG="$WORKDIR/http-server.log"
+python3 "$ROOT/tests/http-fixture-server.py" "$PORT_FILE" "$RANGE_LOG" 2> "$SERVER_LOG" &
 SERVER_PID=$!
 for _ in {1..50}; do
     [[ -s "$PORT_FILE" ]] && break
     sleep 0.02
 done
-[[ -s "$PORT_FILE" ]]
+if [[ ! -s "$PORT_FILE" ]]; then
+    printf 'El servidor HTTP de pruebas no inició.\n' >&2
+    [[ ! -s "$SERVER_LOG" ]] || cat -- "$SERVER_LOG" >&2
+    exit 1
+fi
 TEST_BASE="http://127.0.0.1:$(cat "$PORT_FILE")"
 
-probe_hls_url "$TEST_BASE/valid.m3u8" "$TEST_BASE/player" "$TEST_BASE"
-[[ "$PROBE_HTTP_STATUS" == 206 ]]
+if ! probe_hls_url "$TEST_BASE/valid.m3u8" "$TEST_BASE/player" "$TEST_BASE"; then
+    printf 'El probe HLS local falló: %s.\n' "$PROBE_REASON" >&2
+    exit 1
+fi
+if [[ "$PROBE_HTTP_STATUS" != 206 ]]; then
+    printf 'El probe HLS local devolvió HTTP %s, se esperaba 206.\n' "$PROBE_HTTP_STATUS" >&2
+    exit 1
+fi
 if probe_hls_url "$TEST_BASE/missing.m3u8" "$TEST_BASE/player" "$TEST_BASE"; then
     printf 'Un HLS 404 no debe ser válido.\n' >&2
     exit 1

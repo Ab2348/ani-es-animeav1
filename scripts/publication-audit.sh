@@ -83,10 +83,22 @@ if subprocess.run(
     ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
 ).returncode == 0:
-    identities = subprocess.run(
-        ["git", "-C", str(root), "log", "--all", "--format=%ae%n%ce"],
+    refs = subprocess.run(
+        ["git", "-C", str(root), "for-each-ref", "--format=%(refname)",
+         "refs/heads", "refs/remotes", "refs/tags"],
         check=True, capture_output=True,
-    ).stdout.splitlines()
+    ).stdout.decode("utf-8", errors="replace").splitlines()
+    # actions/checkout guarda el merge efímero de un PR bajo
+    # refs/remotes/pull/<n>/merge. No forma parte del historial publicable y
+    # GitHub puede crearlo con la identidad privada de quien abrió el PR.
+    refs = [ref for ref in refs
+            if not re.fullmatch(r"refs/remotes/pull/\d+/(?:head|merge)", ref)]
+    identities = []
+    if refs:
+        identities = subprocess.run(
+            ["git", "-C", str(root), "log", "--format=%ae%n%ce", *refs],
+            check=True, capture_output=True,
+        ).stdout.splitlines()
     tag_identities = subprocess.run(
         ["git", "-C", str(root), "for-each-ref", "--format=%(taggeremail)", "refs/tags"],
         check=True, capture_output=True,
