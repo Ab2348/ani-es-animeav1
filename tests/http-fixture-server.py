@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
-import faulthandler
-import signal
 import sys
-
-faulthandler.register(signal.SIGUSR1)
-print("fixture-server: intérprete iniciado", file=sys.stderr, flush=True)
-
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-
-print("fixture-server: módulos importados", file=sys.stderr, flush=True)
 
 fixtures = Path(__file__).with_name("fixtures")
 port_file = Path(sys.argv[1])
@@ -57,5 +49,4 @@ class Handler(BaseHTTPRequestHandler):
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 port_file.write_text(str(server.server_port), encoding="utf-8")
-print(f"fixture-server: escuchando en {server.server_port}", file=sys.stderr, flush=True)
 server.serve_forever()

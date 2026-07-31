@@ -22,7 +22,9 @@ Se admite:
 
 - Linux con Bash 4 o posterior.
 - WSL con Bash 4 o posterior y un reproductor funcional.
-- macOS con una versión moderna de Bash instalada mediante Homebrew u otro gestor.
+
+> [!WARNING]
+> El soporte completo de macOS está pendiente. El instalador se valida con Bash de Homebrew, pero la suite HTTP y de reproducción aún no se considera bloqueante en esa plataforma.
 
 Dependencias requeridas:
 
@@ -183,6 +185,7 @@ ANI_ES_LIVE_LANGUAGE=dub ANI_ES_LIVE_SERVER=mp4upload ./tests/integration-live.s
 ## Limitaciones
 
 - Los sitios y hosts externos pueden cambiar o dejar de estar disponibles.
+- El soporte completo de macOS está pendiente; actualmente sólo se garantiza la validación del instalador.
 - UPNShare y Mega pueden requerir JavaScript o clientes específicos; `auto` intenta otros servidores.
 - La ficha general de AnimeAV1 no siempre declara variantes por episodio; se comprueban al elegirlo.
 - Algunas películas usan internamente el episodio `0`; el selector muestra `1` y conserva la URL real.

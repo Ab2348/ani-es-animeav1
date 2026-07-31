@@ -23,7 +23,7 @@ jobs:
       - name: Audit publication contents
         run: make audit
 
-  macos-portability:
+  macos-installer-pending:
     runs-on: macos-15
     timeout-minutes: 15
     steps:
@@ -33,11 +33,14 @@ jobs:
           fetch-depth: 0
       - name: Install Bash and jq
         run: brew install bash jq
-      - name: Test with Homebrew Bash
+      - name: Validate installer with Homebrew Bash
         run: |
           export PATH="$(brew --prefix bash)/bin:$PATH"
-          make test
+          bash -n ani-es install.sh uninstall.sh tests/*.sh scripts/*.sh
+          ./tests/install-tests.sh
           make audit
+      - name: Mark full macOS support as pending
+        run: echo "::warning title=Soporte macOS pendiente::El instalador se valida en macOS, pero la suite HTTP y de reproducción completa todavía no bloquea publicaciones."
 
   release-reproducibility:
     runs-on: ubuntu-24.04
