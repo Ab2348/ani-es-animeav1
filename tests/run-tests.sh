@@ -99,6 +99,9 @@ while [[ ! -s "$PORT_FILE" && "$SECONDS" -lt "$server_deadline" ]]; do
 done
 if [[ ! -s "$PORT_FILE" ]]; then
     printf 'El servidor HTTP de pruebas no inició dentro de 20 segundos.\n' >&2
+    kill -USR1 "$SERVER_PID" 2>/dev/null || true
+    sleep 0.2
+    ps -p "$SERVER_PID" -o pid=,ppid=,state=,etime=,command= >&2 || true
     [[ ! -s "$SERVER_LOG" ]] || cat -- "$SERVER_LOG" >&2
     exit 1
 fi
