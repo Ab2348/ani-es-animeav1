@@ -92,12 +92,13 @@ RANGE_LOG="$WORKDIR/range.log"
 SERVER_LOG="$WORKDIR/http-server.log"
 python3 "$ROOT/tests/http-fixture-server.py" "$PORT_FILE" "$RANGE_LOG" 2> "$SERVER_LOG" &
 SERVER_PID=$!
-for _ in {1..50}; do
-    [[ -s "$PORT_FILE" ]] && break
-    sleep 0.02
+server_deadline=$((SECONDS + 20))
+while [[ ! -s "$PORT_FILE" && "$SECONDS" -lt "$server_deadline" ]]; do
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    sleep 0.1
 done
 if [[ ! -s "$PORT_FILE" ]]; then
-    printf 'El servidor HTTP de pruebas no inició.\n' >&2
+    printf 'El servidor HTTP de pruebas no inició dentro de 20 segundos.\n' >&2
     [[ ! -s "$SERVER_LOG" ]] || cat -- "$SERVER_LOG" >&2
     exit 1
 fi
